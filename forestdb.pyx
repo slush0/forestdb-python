@@ -309,9 +309,24 @@ cdef decode(char *ptr, size_t n, free_ptr=True):
 
 cdef bint IS_PY3K = sys.version_info[0] == 3
 
+if IS_PY3K:
+    long = int
 
-EXC_MAPPING = {}
-EXC_MESSAGES = {}
+
+class TransactionException(Exception):
+    pass
+
+
+EXC_MAPPING = {
+    -9: KeyError,
+    -26: TransactionException,
+    -27: TransactionException,
+}
+EXC_MESSAGES = {
+    -9: 'Key not found.',
+    -26: 'Transaction failed.',
+    -27: 'An active transaction in progress.',
+}
 
 
 cdef inline _errcheck(int rc):
@@ -368,13 +383,14 @@ cdef class ForestDB(object):
     def kv(self, name, **config):
         return KVStore(self, name, **config)
 
-    def commit(self):
-        _errcheck(fdb_commit(self.handle, FDB_COMMIT_NORMAL))
-        return True
+    def __getitem__(self, name):
+        return KVStore(self, name)
 
-    def flush_wal(self):
+    cpdef commit(self):
+        _errcheck(fdb_commit(self.handle, FDB_COMMIT_NORMAL))
+
+    cpdef flush_wal(self):
         _errcheck(fdb_commit(self.handle, FDB_COMMIT_MANUAL_WAL_FLUSH))
-        return True
 
     def buffer_cache_used(self):
         cdef size_t cache_used = fdb_get_buffer_cache_used()
@@ -394,6 +410,22 @@ cdef class ForestDB(object):
             'space_used': info.space_used,
             'file_size': info.file_size,
             'num_kv_stores': info.num_kv_stores}
+
+    cpdef begin_transaction(self, dirty_reads=False):
+        if dirty_reads:
+            isolation_level = FDB_ISOLATION_READ_UNCOMMITTED
+        else:
+            isolation_level = FDB_ISOLATION_READ_COMMITTED
+        _errcheck(fdb_begin_transaction(self.handle, isolation_level))
+
+    cpdef commit_transaction(self):
+        _errcheck(fdb_end_transaction(self.handle, FDB_COMMIT_NORMAL))
+
+    cpdef rollback_transaction(self):
+        _errcheck(fdb_abort_transaction(self.handle))
+
+    def transaction(self):
+        return Transaction(self)
 
 
 cdef class KVStore(object):
@@ -520,10 +552,13 @@ cdef class KVStore(object):
     def __getitem__(self, key):
         if isinstance(key, slice):
             pass
-        elif isinstance(key, int):
-            pass
+        elif isinstance(key, (int, long)):
+            result = self.get_by_seqnum(key)
         else:
-            return self.get(key)
+            result = self.get(key)
+        if result is None:
+            raise KeyError(key)
+        return result
 
     def __delitem__(self, key):
         if isinstance(key, slice):
@@ -531,8 +566,10 @@ cdef class KVStore(object):
         else:
             self.delete(key)
 
-    def document(self, key, meta=None, body=None):
-        return Document.__new__(Document, self, key, meta, body)
+    def document(self, key=None, meta=None, body=None, seqnum=None,
+                 _create=True):
+        return Document.__new__(Document, self, key, meta, body, seqnum,
+                                _create)
 
     cpdef last_seqnum(self):
         cdef uint64_t seqnum
@@ -572,13 +609,13 @@ cdef class Document(object):
         readonly KVStore kv
 
     def __cinit__(self, KVStore kv, key=None, meta=None, body=None,
-                  _create=True):
+                  seqnum=None, _create=True):
         cdef:
             bytes bkey, bmeta, bbody
-            char *_key
+            char *_key = NULL
             char *_meta = NULL
             char *_body = NULL
-            Py_ssize_t _key_len, _meta_len = 0, _body_len = 0
+            Py_ssize_t _key_len = 0, _meta_len = 0, _body_len = 0
             fdb_status status
 
         self.kv = kv
@@ -604,9 +641,16 @@ cdef class Document(object):
                 <void *>(_body),
                 <size_t>(_body_len)))
 
+            if seqnum is not None:
+                self.handle.seqnum = <uint64_t>seqnum
+
     def __dealloc__(self):
         if self.handle:
             fdb_doc_free(self.handle)
+
+    cdef _check_handle(self):
+        if not self.handle:
+            raise ValueError('Document handle not initialized.')
 
     cdef set_document(self, fdb_doc *doc):
         self.handle = doc
@@ -641,37 +685,56 @@ cdef class Document(object):
         _errcheck(fdb_get(self.kv.handle, self.handle))
         return self.handle.seqnum
 
+    def get_by_seqnum(self):
+        _errcheck(fdb_get_byseq(self.kv.handle, self.handle))
+        return self.handle.seqnum
+
     def get_metadata(self):
         _errcheck(fdb_get_metaonly(self.kv.handle, self.handle))
-        return self.meta
+        return self.handle.seqnum
+
+    def get_metadata_by_seqnum(self):
+        _errcheck(fdb_get_metaonly_byseq(self.kv.handle, self.handle))
+        return self.handle.seqnum
 
     def delete(self):
         _errcheck(fdb_del(self.kv.handle, self.handle))
 
     property key:
         def __get__(self):
+            self._check_handle()
             return decode(<char *>self.handle.key, self.handle.keylen, False)
 
     property meta:
         def __get__(self):
+            self._check_handle()
             return decode(<char *>self.handle.meta, self.handle.metalen, False)
 
         def __set__(self, value):
+            self._check_handle()
             self.update(value, self.body)
 
     property body:
         def __get__(self):
+            self._check_handle()
             return decode(<char *>self.handle.body, self.handle.bodylen, False)
 
         def __set__(self, value):
+            self._check_handle()
             self.update(self.meta, value)
 
     property seqnum:
         def __get__(self):
+            self._check_handle()
             return self.handle.seqnum
+
+        def __set__(self, value):
+            self._check_handle()
+            self.handle.seqnum = <uint64_t>(value)
 
     property disk_offset:
         def __get__(self):
+            self._check_handle()
             return self.handle.offset
 
 
@@ -765,3 +828,38 @@ cdef class Cursor(object):
 
     def last(self):
         _errcheck(fdb_iterator_seek_to_max(self.handle))
+
+
+cdef class Transaction(object):
+    cdef:
+        ForestDB db
+
+    def __cinit__(self, ForestDB db):
+        self.db = db
+
+    cpdef begin(self):
+        self.db.begin_transaction()
+
+    def __enter__(self):
+        self.begin()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.rollback(False)
+        else:
+            try:
+                self.commit(False)
+            except:
+                self.rollback(False)
+                raise
+
+    cpdef commit(self, begin=True):
+        self.db.commit_transaction()
+        if begin:
+            self.begin()
+
+    cpdef rollback(self, begin=True):
+        self.db.rollback_transaction()
+        if begin:
+            self.begin()
