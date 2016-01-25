@@ -232,6 +232,7 @@ cdef extern from "libforestdb/forestdb.h":
     cdef fdb_status fdb_get_kvs_seqnum(fdb_kvs_handle *, uint64_t *)
     cdef fdb_status fdb_get_kvs_name_list(fdb_file_handle *,
                                           fdb_kvs_name_list *)
+    cdef fdb_status fdb_free_kvs_name_list(fdb_kvs_name_list *)
 
     cdef fdb_status fdb_close(fdb_file_handle *)
     cdef fdb_status fdb_destroy(const char *, fdb_config *)
@@ -350,6 +351,21 @@ cdef inline _errcheck(int rc):
     raise exc_class('%s: %s' % (exc_message, rc))
 
 
+cdef fdb_encryption_key create_encryption_key(
+        key,
+        algorithm=FDB_ENCRYPTION_AES256):
+    cdef:
+        bytes bkey = encode(key)
+        fdb_encryption_key encryption_key
+        int i
+
+    bkey += ('\x00' * (32 - len(bkey)))
+    for i in range(32):
+        encryption_key.bytes[i] = ord(bkey[i])
+    encryption_key.algorithm = algorithm
+    return encryption_key
+
+
 cdef class ForestDB(object):
     cdef:
         bint active_transaction
@@ -361,7 +377,9 @@ cdef class ForestDB(object):
         readonly filename
 
     def __cinit__(self, filename, autocommit=True, buffer_cache=None,
-                  compress=False, purging_interval=None, wal_threshold=None):
+                  compress=False, purging_interval=None, wal_threshold=None,
+                  compaction_mode=None, compaction_threshold=None,
+                  encryption_key=None, durability=None, async_writes=False):
         cdef:
             fdb_status status
 
@@ -385,6 +403,16 @@ cdef class ForestDB(object):
             self.config.purging_interval = purging_interval
         if wal_threshold is not None:
             self.config.wal_threshold = wal_threshold
+        if compaction_mode is not None:
+            self.config.compaction_mode = compaction_mode
+        if compaction_threshold is not None:
+            self.config.compaction_threshold = compaction_threshold
+        if encryption_key is not None:
+            self.config.encryption_key = create_encryption_key(encryption_key)
+        if async_writes:
+            self.config.durability_opt = FDB_DRB_ASYNC
+        elif durability is not None:
+            self.config.durability_opt = durability
 
         # Initialize and open database file handle.
         status = fdb_open(&self.handle, self.encoded_filename, &self.config)
@@ -415,11 +443,32 @@ cdef class ForestDB(object):
         self.is_open = False
         return True
 
+    def rekey(self, key, encryption=FDB_ENCRYPTION_AES256):
+        cdef:
+            fdb_encryption_key encryption_key
+
+        encryption_key = create_encryption_key(key, encryption)
+        _errcheck(fdb_rekey(self.handle, encryption_key))
+        return True
+
     def kv(self, name, **config):
         return KVStore(self, name, **config)
 
     def __getitem__(self, name):
         return KVStore(self, name)
+
+    def get_kv_names(self):
+        cdef:
+            fdb_kvs_name_list names
+            int i = 0
+
+        _errcheck(fdb_get_kvs_name_list(self.handle, &names))
+        kv_names = []
+        for i in range(names.num_kvs_names):
+            kv_names.append(str(names.kvs_names[i]))
+
+        _errcheck(fdb_free_kvs_name_list(&names))
+        return kv_names
 
     cpdef bint commit(self):
         if self.active_transaction:
@@ -429,6 +478,11 @@ cdef class ForestDB(object):
 
     cpdef flush_wal(self):
         _errcheck(fdb_commit(self.handle, FDB_COMMIT_MANUAL_WAL_FLUSH))
+
+    def compact(self, filename=None):
+        cdef bytes bfilename = encode(filename)
+        _errcheck(fdb_compact(self.handle, bfilename))
+        return True
 
     def buffer_cache_used(self):
         cdef size_t cache_used = fdb_get_buffer_cache_used()
@@ -441,7 +495,7 @@ cdef class ForestDB(object):
         _errcheck(fdb_get_file_info(self.handle, &info))
         return {
             'filename': info.filename,
-            'new_filename': info.new_filename,
+            #'new_filename': info.new_filename,  # SEGFAULTs.
             'doc_count': info.doc_count,
             'deleted_count': info.deleted_count,
             'space_used': info.space_used,

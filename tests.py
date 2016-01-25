@@ -14,13 +14,16 @@ class BaseTestCase(unittest.TestCase):
         if os.path.exists(DB_FILE):
             os.unlink(DB_FILE)
 
-        self.db = ForestDB(DB_FILE)
+        self.db = self.get_db()
         self.kv = self.db['kv-1']
 
     def tearDown(self):
         self.db.close()
         if os.path.exists(DB_FILE):
             os.unlink(DB_FILE)
+
+    def get_db(self):
+        return ForestDB(DB_FILE)
 
 
 class TestForestDB(BaseTestCase):
@@ -62,6 +65,47 @@ class TestForestDB(BaseTestCase):
         self.kv.open()
         self.assertEqual(self.kv['k1'], 'v1')
         self.assertRaises(KeyError, lambda: self.kv['k2'])
+
+    def test_kvs_names(self):
+        self.assertEqual(self.db.get_kv_names(), ['default', 'kv-1'])
+
+        self.db.kv('kv-2')
+        self.db.kv('kv-3')
+        self.assertEqual(self.db.get_kv_names(), 
+                         ['default', 'kv-1', 'kv-2', 'kv-3'])
+
+
+class TestDBEncryption(BaseTestCase):
+    def get_db(self):
+        return ForestDB(DB_FILE, encryption_key='testing')
+
+    def test_encryption(self):
+        val = 'value-testing-encryption'
+        self.kv['k1'] = val
+        self.assertEqual(self.kv['k1'], val)
+
+        self.kv.close()
+        self.db.close()
+
+        self.db.open()
+        self.kv.open()
+        self.assertEqual(self.kv['k1'], val)
+
+        self.db.close()
+
+        with open(DB_FILE, 'rb') as fh:
+            data = fh.read()
+            self.assertFalse(val in data)
+
+
+class TestDBInfo(BaseTestCase):
+    def test_db_info(self):
+        self.kv.update(k1='v1', k2='v2', k3='v3', k4='v4')
+        del self.kv['k4']
+        info = self.db.info()
+        self.assertEqual(info['num_kv_stores'], 2)
+        self.assertEqual(info['doc_count'], 3)
+        self.assertEqual(info['deleted_count'], 1)
 
 
 class TestKVOperations(BaseTestCase):
