@@ -10,6 +10,8 @@ python_source = 'forestdb.pyx'
 
 extension = Extension(
     'forestdb',
+    #extra_compile_args=['-g', '-O1'],
+    #extra_link_args=['-g'],
     sources=[python_source],
     libraries=['forestdb'])
 

@@ -105,8 +105,6 @@ cdef extern from "libforestdb/forestdb.h":
         size_t num_kvs_names
         char **kvs_names
 
-    ctypedef struct fdb_iterator
-
     cdef fdb_status fdb_init(fdb_config *config)
     cdef fdb_config fdb_get_default_config()
     cdef fdb_kvs_config fdb_get_default_kvs_config()
@@ -340,13 +338,15 @@ cdef inline _errcheck(int rc):
 
 cdef class ForestDB(object):
     cdef:
+        bint active_transaction
         bytes encoded_filename
         fdb_config config
         fdb_file_handle *handle
+        public bint autocommit
         readonly bint is_open
         readonly filename
 
-    def __cinit__(self, filename, **config):
+    def __cinit__(self, filename, autocommit=True, **config):
         cdef:
             fdb_status status
 
@@ -355,6 +355,10 @@ cdef class ForestDB(object):
             self.encoded_filename = fsencode(filename)
         else:
             self.encoded_filename = encode(filename)
+
+        # Set autocommit mode.
+        self.autocommit = autocommit
+        self.active_transaction = False
 
         # Update configuration values.
         self.config = fdb_get_default_config()
@@ -368,6 +372,14 @@ cdef class ForestDB(object):
         if self.is_open and self.handle:
             fdb_close(self.handle)
             self.handle = <fdb_file_handle *>0
+
+    cpdef bint open(self):
+        if self.is_open:
+            return False
+
+        _errcheck(fdb_open(&self.handle, self.encoded_filename, &self.config))
+        self.is_open = True
+        return True
 
     cpdef bint close(self):
         if not self.is_open:
@@ -386,8 +398,11 @@ cdef class ForestDB(object):
     def __getitem__(self, name):
         return KVStore(self, name)
 
-    cpdef commit(self):
+    cpdef bint commit(self):
+        if self.active_transaction:
+            return False
         _errcheck(fdb_commit(self.handle, FDB_COMMIT_NORMAL))
+        return True
 
     cpdef flush_wal(self):
         _errcheck(fdb_commit(self.handle, FDB_COMMIT_MANUAL_WAL_FLUSH))
@@ -401,7 +416,6 @@ cdef class ForestDB(object):
             fdb_file_info info
 
         _errcheck(fdb_get_file_info(self.handle, &info))
-
         return {
             'filename': info.filename,
             'new_filename': info.new_filename,
@@ -411,26 +425,40 @@ cdef class ForestDB(object):
             'file_size': info.file_size,
             'num_kv_stores': info.num_kv_stores}
 
-    cpdef begin_transaction(self, dirty_reads=False):
+    cpdef bint begin_transaction(self, dirty_reads=False):
+        if self.active_transaction:
+            return False
+
+        self.active_transaction = True
         if dirty_reads:
             isolation_level = FDB_ISOLATION_READ_UNCOMMITTED
         else:
             isolation_level = FDB_ISOLATION_READ_COMMITTED
         _errcheck(fdb_begin_transaction(self.handle, isolation_level))
+        return True
 
-    cpdef commit_transaction(self):
+    cpdef bint commit_transaction(self):
+        if not self.active_transaction:
+            return False
         _errcheck(fdb_end_transaction(self.handle, FDB_COMMIT_NORMAL))
+        self.active_transaction = False
+        return True
 
-    cpdef rollback_transaction(self):
+    cpdef bint rollback_transaction(self):
+        if not self.active_transaction:
+            return False
         _errcheck(fdb_abort_transaction(self.handle))
+        self.active_transaction = False
+        return True
 
-    def transaction(self):
-        return Transaction(self)
+    cpdef Transaction transaction(self):
+        return Transaction.__new__(Transaction, self)
 
 
 cdef class KVStore(object):
     cdef:
         bytes encoded_name
+        fdb_file_handle *db_handle
         fdb_kvs_config config
         fdb_kvs_handle *handle
         readonly bint is_open
@@ -444,6 +472,7 @@ cdef class KVStore(object):
         self.db = db
         if not db.is_open:
             raise Exception('Cannot create KVStore on closed database.')
+        self.db_handle = self.db.handle
 
         self.name = name
         self.encoded_name = encode(name)
@@ -463,6 +492,20 @@ cdef class KVStore(object):
     def __dealloc__(self):
         if self.is_open and self.db.handle:
             fdb_kvs_close(self.handle)
+
+    cpdef bint open(self):
+        if self.is_open and self.db.is_open and self.db_handle == self.db.handle:
+            return False
+
+        # Open key-value store.
+        _errcheck(fdb_kvs_open(
+            self.db.handle,
+            &self.handle,
+            <const char *>self.encoded_name,
+            &self.config))
+        self.is_open = True
+        self.db_handle = self.db.handle
+        return True
 
     cpdef bint close(self):
         if not self.is_open:
@@ -500,6 +543,9 @@ cdef class KVStore(object):
             <void *>bptr,
             <size_t>blen))
 
+        if self.db.autocommit:
+            self.db.commit()
+
         return True
 
     cpdef bint delete(self, key):
@@ -512,6 +558,10 @@ cdef class KVStore(object):
 
         PyBytes_AsStringAndSize(key, &kptr, &klen)
         _errcheck(fdb_del_kv(self.handle, <void *>kptr, <size_t>klen))
+
+        if self.db.autocommit:
+            self.db.commit()
+
         return True
 
     cpdef get(self, key):
@@ -602,6 +652,19 @@ cdef class KVStore(object):
             'num_iterator_gets': info.num_iterator_gets,
             'num_iterator_moves': info.num_iterator_moves}
 
+    cpdef Cursor cursor(self, start=None, stop=None, skip_start=False,
+                        skip_stop=False, reverse=False):
+        return Cursor(
+            self,
+            start=start,
+            stop=stop,
+            skip_start=skip_start,
+            skip_stop=skip_stop,
+            reverse=reverse)
+
+    def __iter__(self):
+        return iter(self.cursor())
+
 
 cdef class Document(object):
     cdef:
@@ -648,6 +711,14 @@ cdef class Document(object):
         if self.handle:
             fdb_doc_free(self.handle)
 
+    def close(self):
+        if self.handle:
+            fdb_doc_free(self.handle)
+            self.handle = NULL
+            return True
+        else:
+            return False
+
     cdef _check_handle(self):
         if not self.handle:
             raise ValueError('Document handle not initialized.')
@@ -655,7 +726,7 @@ cdef class Document(object):
     cdef set_document(self, fdb_doc *doc):
         self.handle = doc
 
-    def update(self, meta, body):
+    cpdef update(self, meta, body):
         cdef:
             char *_meta = NULL
             char *_body = NULL
@@ -677,28 +748,32 @@ cdef class Document(object):
             <void *>(_body),
             <size_t>(_body_len)))
 
-    def insert(self):
+    cpdef insert(self):
         _errcheck(fdb_set(self.kv.handle, self.handle))
+        if self.kv.db.autocommit:
+            self.kv.db.commit()
         return self.handle.seqnum
 
-    def get(self):
+    cpdef get(self):
         _errcheck(fdb_get(self.kv.handle, self.handle))
         return self.handle.seqnum
 
-    def get_by_seqnum(self):
+    cpdef get_by_seqnum(self):
         _errcheck(fdb_get_byseq(self.kv.handle, self.handle))
         return self.handle.seqnum
 
-    def get_metadata(self):
+    cpdef get_metadata(self):
         _errcheck(fdb_get_metaonly(self.kv.handle, self.handle))
         return self.handle.seqnum
 
-    def get_metadata_by_seqnum(self):
+    cpdef get_metadata_by_seqnum(self):
         _errcheck(fdb_get_metaonly_byseq(self.kv.handle, self.handle))
         return self.handle.seqnum
 
-    def delete(self):
+    cpdef delete(self):
         _errcheck(fdb_del(self.kv.handle, self.handle))
+        if self.kv.db.autocommit:
+            self.kv.db.commit()
 
     property key:
         def __get__(self):
@@ -740,58 +815,60 @@ cdef class Document(object):
 
 cdef class Cursor(object):
     cdef:
-        bint reverse
-        bint stopped
+        bint reverse, stopped
+        bytes bstart, bstop
         KVStore kv
         fdb_iterator *handle
+        uint16_t options
 
     def __cinit__(self, KVStore kv, start=None, stop=None, skip_start=False,
                   skip_stop=False, reverse=False):
+        self.kv = kv
+        self.bstart = encode(start)
+        self.bstop = encode(stop)
+        self.reverse = reverse
+        self.options = FDB_ITR_NO_DELETES
+        if skip_start:
+            self.options |= FDB_ITR_SKIP_MIN_KEY
+        if skip_stop:
+            self.options |= FDB_ITR_SKIP_MAX_KEY
+
+        self.handle = NULL
+        self.stopped = True
+
+    def __dealloc__(self):
+        if self.handle and self.kv.is_open and self.kv.db.is_open:
+            fdb_iterator_close(self.handle)
+
+    def __iter__(self):
         cdef:
-            bytes bstart, bstop
             char *_start = NULL
             char *_stop = NULL
             Py_ssize_t start_len = 0, stop_len = 0
-            uint16_t options
 
-        bstart = encode(start)
-        bstop = encode(stop)
-
-        if start is not None:
-            PyBytes_AsStringAndSize(bstart, &_start, &start_len)
-        if stop is not None:
-            PyBytes_AsStringAndSize(bstop, &_stop, &stop_len)
-
-        self.kv = kv
-        self.reverse = reverse
-
-        options = FDB_ITR_NO_DELETES
-        if skip_start:
-            options |= FDB_ITR_SKIP_MIN_KEY
-        if skip_stop:
-            options |= FDB_ITR_SKIP_MAX_KEY
+        self.stopped = False
+        if self.bstart is not None:
+            PyBytes_AsStringAndSize(self.bstart, &_start, &start_len)
+        if self.bstop is not None:
+            PyBytes_AsStringAndSize(self.bstop, &_stop, &stop_len)
 
         _errcheck(fdb_iterator_init(
             self.kv.handle,
             &self.handle,
-            _start,
+            <void *>_start,
             start_len,
-            _stop,
+            <void *>_stop,
             stop_len,
-            options))
-        self.stopped = False
+            self.options))
 
-        #cdef uint8_t FDB_ITR_SEEK_HIGHER = 0x00
-        #cdef uint8_t FDB_ITR_SEEK_LOWER = 0x01
+        if self.reverse:
+            fdb_iterator_seek_to_max(self.handle)
 
-    def __dealloc__(self):
-        if self.handle:
-            fdb_iterator_close(self.handle)
+        return self
 
     def __next__(self):
         cdef:
-            Document document
-            fdb_doc *doc
+            fdb_doc *doc = NULL
             fdb_status status
 
         if self.stopped:
@@ -801,9 +878,7 @@ cdef class Cursor(object):
         if status != FDB_RESULT_SUCCESS:
             raise StopIteration
 
-        document = Document.__new__(Document, _create=False)
-        document.set_document(doc)
-
+        obj = self._value_from_doc(doc)
         if self.reverse:
             status = fdb_iterator_prev(self.handle)
         else:
@@ -812,9 +887,15 @@ cdef class Cursor(object):
         if status == FDB_RESULT_ITERATOR_FAIL:
             self.stopped = True
 
+        return obj
+
+    cdef _value_from_doc(self, fdb_doc *doc):
+        cdef Document document
+        document = Document.__new__(Document, self.kv, _create=False)
+        document.set_document(doc)
         return document
 
-    def seek(self, key, mode=FDB_ITR_SEEK_HIGHER):
+    cpdef seek(self, key, mode=FDB_ITR_SEEK_HIGHER):
         cdef:
             bytes bkey = encode(key)
             char *_key
@@ -823,10 +904,10 @@ cdef class Cursor(object):
         PyBytes_AsStringAndSize(bkey, &_key, &keylen)
         _errcheck(fdb_iterator_seek(self.handle, _key, keylen, mode))
 
-    def first(self):
+    cpdef first(self):
         _errcheck(fdb_iterator_seek_to_min(self.handle))
 
-    def last(self):
+    cpdef last(self):
         _errcheck(fdb_iterator_seek_to_max(self.handle))
 
 

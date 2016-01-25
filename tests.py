@@ -23,6 +23,47 @@ class BaseTestCase(unittest.TestCase):
             os.unlink(DB_FILE)
 
 
+class TestForestDB(BaseTestCase):
+    def test_db_open_close(self):
+        self.kv['k1'] = 'v1'
+
+        kv2 = self.db['kv2']
+        kv2['k1'] = 'v2'
+
+        self.kv.close()
+        kv2.close()
+        self.db.close()
+
+        self.db.open()
+        self.kv.open()
+        kv2.open()
+
+        self.assertEqual(self.kv['k1'], 'v1')
+        self.assertEqual(kv2['k1'], 'v2')
+
+    def test_autocommit_off(self):
+        self.kv['k1'] = 'v1'
+
+        self.kv.close()
+        self.db.close()
+
+        self.db.autocommit = False
+
+        self.db.open()
+        self.kv.open()
+
+        self.assertEqual(self.kv['k1'], 'v1')
+        self.kv['k1'] = 'v1-e'
+        self.kv['k2'] = 'v2'
+        self.kv.close()
+        self.db.close()
+
+        self.db.open()
+        self.kv.open()
+        self.assertEqual(self.kv['k1'], 'v1')
+        self.assertRaises(KeyError, lambda: self.kv['k2'])
+
+
 class TestKVOperations(BaseTestCase):
     def test_get_set_del(self):
         self.kv.set('k1', 'v1')
@@ -204,6 +245,182 @@ class TestTransaction(BaseTestCase):
 
         self.assertEqual(self.kv['k1'], 'v1-e2')
         self.assertEqual(self.kv['k2'], 'v2')
+
+
+class TestCursor(BaseTestCase):
+    def setUp(self):
+        super(TestCursor, self).setUp()
+
+        self.test_data = [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3'),
+            ('dd', 'r4'),
+            ('ee', 'r5'),
+            ('gg', 'r6'),
+            ('zz', 'r7'),
+        ]
+        for key, value in self.test_data:
+            self.kv[key] = value
+
+    def test_simple_iteration(self):
+        documents = [row for row in self.kv]
+        data = [(doc.key, doc.body) for doc in documents]
+        self.assertEqual(self.test_data, data)
+
+    def test_multi_iterations(self):
+        cursor = self.kv.cursor()
+
+        data = [(doc.key, doc.body) for doc in cursor]
+        self.assertEqual(self.test_data, data)
+
+        data = [(doc.key, doc.body) for doc in cursor]
+        self.assertEqual(self.test_data, data)
+
+    def assertRange(self, cursor, expected):
+        data = [(doc.key, doc.body) for doc in cursor]
+        self.assertEqual(data, expected)
+
+    def test_cursor_range_start(self):
+        cursor = self.kv.cursor(start='dd')  # Key exists.
+        self.assertRange(cursor, [
+            ('dd', 'r4'),
+            ('ee', 'r5'),
+            ('gg', 'r6'),
+            ('zz', 'r7')])
+
+        cursor = self.kv.cursor(start='dd', skip_start=True)
+        self.assertRange(cursor, [
+            ('ee', 'r5'),
+            ('gg', 'r6'),
+            ('zz', 'r7')])
+
+        cursor = self.kv.cursor(start='de')  # Key does not exist.
+        self.assertRange(cursor, [
+            ('ee', 'r5'),
+            ('gg', 'r6'),
+            ('zz', 'r7')])
+
+        cursor = self.kv.cursor(start='de', skip_start=True)
+        self.assertRange(cursor, [
+            ('ee', 'r5'),  # No effect since not exact match.
+            ('gg', 'r6'),
+            ('zz', 'r7')])
+
+        cursor = self.kv.cursor(start='\x01')  # Key below first record.
+        self.assertRange(cursor, self.test_data)
+
+        cursor = self.kv.cursor(start='\x01', skip_start=True)
+        self.assertRange(cursor, self.test_data)
+
+        cursor = self.kv.cursor(start='\xff')  # Key after last record.
+        self.assertRange(cursor, [])
+
+    def test_cursor_range_stop(self):
+        cursor = self.kv.cursor(stop='dd')  # Key exists.
+        self.assertRange(cursor, [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3'),
+            ('dd', 'r4')])
+
+        cursor = self.kv.cursor(stop='dd', skip_stop=True)
+        self.assertRange(cursor, [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3')])
+
+        cursor = self.kv.cursor(stop='cc')  # Key does not exist.
+        self.assertRange(cursor, [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3')])
+
+        cursor = self.kv.cursor(stop='cc', skip_stop=True)
+        self.assertRange(cursor, [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3')])
+
+        cursor = self.kv.cursor(stop='\x01')  # Key below first record.
+        self.assertRange(cursor, [])
+
+        cursor = self.kv.cursor(stop='\xff')  # Key after last record.
+        self.assertRange(cursor, self.test_data)
+
+        cursor = self.kv.cursor(stop='\xff', skip_stop=True)
+        self.assertRange(cursor, self.test_data)
+
+    def test_start_stop(self):
+        cursor = self.kv.cursor(start='bb', stop='ee')  # Both exist.
+        self.assertRange(cursor, [
+            ('bb', 'r2'),
+            ('bbb', 'r3'),
+            ('dd', 'r4'),
+            ('ee', 'r5')])
+
+        cursor = self.kv.cursor(start='cc', stop='ff')  # Neither exist.
+        self.assertRange(cursor, [
+            ('dd', 'r4'),
+            ('ee', 'r5')])
+
+        cursor = self.kv.cursor(start='\x01', stop='\x02')  # Below.
+        self.assertRange(cursor, [])
+
+        cursor = self.kv.cursor(start='\xfe', stop='\xff')  # Above.
+        self.assertRange(cursor, [])
+
+        cursor = self.kv.cursor(start='aa', stop='aa') # Same, exists.
+        self.assertRange(cursor, [('aa', 'r1')])
+
+        cursor = self.kv.cursor(start='cc', stop='cc') # Same, not exists.
+        self.assertRange(cursor, [])
+
+    def test_skip_start_stop(self):
+        cursor = self.kv.cursor('dd', 'gg', True, True)  # Both exist.
+        self.assertRange(cursor, [('ee', 'r5')])
+
+        cursor = self.kv.cursor('dc', 'fg', True, True)  # Neither exist.
+        self.assertRange(cursor, [('dd', 'r4'), ('ee', 'r5')])
+
+        cursor = self.kv.cursor(start='aa', stop='aa', skip_start=True)
+        self.assertRange(cursor, [])
+        cursor = self.kv.cursor(start='aa', stop='aa', skip_stop=True)
+        self.assertRange(cursor, [])
+
+    def test_start_gt_stop(self):
+        cursor = self.kv.cursor(start='dd', stop='aa')
+        self.assertRange(cursor, [])
+
+    def test_reverse(self):
+        cursor = self.kv.cursor(start='aa', stop='dd', reverse=True)
+        self.assertRange(cursor, [
+            ('dd', 'r4'),
+            ('bbb', 'r3'),
+            ('bb', 'r2'),
+            ('aa', 'r1')])
+
+        cursor = self.kv.cursor(start='bc', stop='kk', reverse=True)
+        self.assertRange(cursor, [
+            ('gg', 'r6'),
+            ('ee', 'r5'),
+            ('dd', 'r4')])
+
+        cursor = self.kv.cursor(start='cc', reverse=True)
+        self.assertRange(cursor, [
+            ('zz', 'r7'),
+            ('gg', 'r6'),
+            ('ee', 'r5'),
+            ('dd', 'r4')])
+
+        cursor = self.kv.cursor(stop='cc', reverse=True)
+        self.assertRange(cursor, [
+            ('bbb', 'r3'),
+            ('bb', 'r2'),
+            ('aa', 'r1')])
+
+        cursor = self.kv.cursor(reverse=True)
+        self.assertRange(cursor, list(reversed(self.test_data)))
 
 
 if __name__ == '__main__':
