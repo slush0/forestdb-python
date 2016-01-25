@@ -672,9 +672,26 @@ cdef class BaseKVStore(object):
 
     def __delitem__(self, key):
         if isinstance(key, slice):
-            pass
+            start = key.start
+            stop = key.stop
+            reverse = bool(key.step)
+            if start and stop and start > stop:
+                start, stop = stop, start
+                reverse = True
+            cursor = self.keys(start, stop, reverse=reverse)
+            with self.db.transaction():
+                for key in cursor:
+                    del self[key]
         else:
             self.delete(key)
+
+    def __contains__(self, key):
+        try:
+            self.get(key)
+        except KeyError:
+            return True
+        else:
+            return False
 
     def update(self, _data_dict=None, **data):
         with self.db.transaction():
@@ -849,9 +866,9 @@ cdef class Snapshot(BaseKVStore):
 cdef class Document(object):
     cdef:
         fdb_doc *handle
-        readonly KVStore kv
+        readonly BaseKVStore kv
 
-    def __cinit__(self, KVStore kv, key=None, meta=None, body=None,
+    def __cinit__(self, BaseKVStore kv, key=None, meta=None, body=None,
                   seqnum=None, _create=True):
         cdef:
             bytes bkey, bmeta, bbody
@@ -997,12 +1014,12 @@ cdef class Cursor(object):
     cdef:
         bint reverse, stopped
         bytes bstart, bstop
-        KVStore kv
+        BaseKVStore kv
         fdb_iterator *handle
         uint16_t options
 
-    def __cinit__(self, KVStore kv, start=None, stop=None, skip_start=False,
-                  skip_stop=False, reverse=False):
+    def __cinit__(self, BaseKVStore kv, start=None, stop=None,
+                  skip_start=False, skip_stop=False, reverse=False):
         self.kv = kv
         self.bstart = encode(start)
         self.bstop = encode(stop)

@@ -99,13 +99,56 @@ class TestDBEncryption(BaseTestCase):
 
 
 class TestDBInfo(BaseTestCase):
-    def test_db_info(self):
+    def setUp(self):
+        super(TestDBInfo, self).setUp()
+        self.kv2 = self.db.kv('kv2')
+
         self.kv.update(k1='v1', k2='v2', k3='v3', k4='v4')
         del self.kv['k4']
+
+        self.kv2.update(k1='v1-2', k2='v2-2')
+
+    def test_db_info(self):
         info = self.db.info()
-        self.assertEqual(info['num_kv_stores'], 2)
-        self.assertEqual(info['doc_count'], 3)
+        self.assertEqual(info['num_kv_stores'], 3)
+        self.assertEqual(info['doc_count'], 5)
         self.assertEqual(info['deleted_count'], 1)
+
+    def test_kv_info(self):
+        info = self.kv.info()
+        self.assertEqual(info['deleted_count'], 1)
+        self.assertEqual(info['doc_count'], 3)
+        self.assertEqual(info['last_seqnum'], 5)
+
+        info = self.kv2.info()
+        self.assertEqual(info['deleted_count'], 0)
+        self.assertEqual(info['doc_count'], 2)
+        self.assertEqual(info['last_seqnum'], 2)
+
+    def test_kv_ops_info(self):
+        info = self.kv.ops_info()
+        self.assertEqual(info['num_sets'], 4)
+        self.assertEqual(info['num_dels'], 1)
+        self.assertEqual(info['num_commits'], 3)
+        self.assertEqual(info['num_gets'], 0)
+
+        info = self.kv2.ops_info()
+        self.assertEqual(info['num_sets'], 2)
+        self.assertEqual(info['num_dels'], 0)
+        self.assertEqual(info['num_commits'], 3)
+        self.assertEqual(info['num_gets'], 0)
+
+        self.kv2['k1']
+        try:
+            self.kv2['kx']
+        except KeyError:
+            pass
+
+        info = self.kv2.ops_info()
+        self.assertEqual(info['num_sets'], 2)
+        self.assertEqual(info['num_dels'], 0)
+        self.assertEqual(info['num_commits'], 3)
+        self.assertEqual(info['num_gets'], 2)
 
 
 class TestKVOperations(BaseTestCase):
@@ -258,6 +301,14 @@ class TestKVOperations(BaseTestCase):
         self.assertEqual(list(K.values(start='cc', reverse=True)), 
                          ['r2', 'r1'])
         self.assertEqual(list(K.keys(start='\x01', reverse=True)), [])
+
+    def test_delete_range(self):
+        for i in range(1, 10):
+            self.kv['k%s' % i] = 'v%s' % i
+
+        del self.kv['k2':'k55']
+        self.assertEqual([key for key in self.kv.keys()], [
+            'k1', 'k6', 'k7', 'k8', 'k9'])
         
 
 class TestDocument(BaseTestCase):
@@ -575,6 +626,47 @@ class TestCursor(BaseTestCase):
 
         cursor = self.kv.cursor(reverse=True)
         self.assertRange(cursor, list(reversed(self.test_data)))
+
+
+class TestSnapshots(BaseTestCase):
+    def test_snapshot(self):
+        self.kv.update(k1='v1', k2='v2', k3='v3')
+
+        snap = self.kv.snapshot()
+        self.assertEqual(snap['k1'], 'v1')
+        self.assertEqual(snap['k2'], 'v2')
+        self.assertEqual(snap['k3'], 'v3')
+
+        self.kv['k1'] = 'v1-e'
+        self.kv['k2'] = 'v2-e'
+        del self.kv['k3']
+
+        self.assertEqual(snap['k1'], 'v1')
+        self.assertEqual(snap['k2'], 'v2')
+        self.assertEqual(snap['k3'], 'v3')
+
+        self.assertEqual(self.kv['k1'], 'v1-e')
+        self.assertEqual(self.kv['k2'], 'v2-e')
+        self.assertFalse('k3' in self.kv)
+
+        snap2 = self.kv.snapshot()
+
+        self.kv['k1'] = 'v1-e2'
+        self.kv['k3'] = 'v3-e2'
+
+        self.assertEqual(snap['k1'], 'v1')
+        self.assertEqual(snap['k2'], 'v2')
+        self.assertEqual(snap['k3'], 'v3')
+        self.assertEqual(snap2['k1'], 'v1-e')
+        self.assertEqual(snap2['k2'], 'v2-e')
+        self.assertFalse('k3' in snap2)
+
+        self.assertEqual(self.kv['k1'], 'v1-e2')
+        self.assertEqual(self.kv['k2'], 'v2-e')
+        self.assertEqual(self.kv['k3'], 'v3-e2')
+
+        self.assertEqual([doc.body for doc in snap], ['v1', 'v2', 'v3'])
+        self.assertEqual([doc.body for doc in snap2], ['v1-e', 'v2-e'])
 
 
 if __name__ == '__main__':
