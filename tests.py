@@ -91,6 +91,12 @@ class TestKVOperations(BaseTestCase):
         # Can delete non-existant keys.
         del self.kv['k3']
 
+    def test_update(self):
+        self.kv.update(k1='v1', k2='v2', k3='v3')
+        self.assertEqual(self.kv['k1'], 'v1')
+        self.assertEqual(self.kv['k2'], 'v2')
+        self.assertEqual(self.kv['k3'], 'v3')
+
     def test_empty_values(self):
         self.kv['k1'] = ''
         self.assertEqual(self.kv['k1'], '')
@@ -98,13 +104,117 @@ class TestKVOperations(BaseTestCase):
     def test_seqnum(self):
         self.kv['k1'] = 'v1'
         self.kv['k2'] = 'v2'
-        seq = self.kv.last_seqnum()
-        doc = self.kv.get_by_seqnum(seq)
-        self.assertEqual(doc.key, 'k2')
-        self.assertEqual(doc.meta, '')
-        self.assertEqual(doc.body, 'v2')
-        self.assertEqual(doc.seqnum, 2)
 
+        seq = self.kv.last_seqnum()
+        body = self.kv.get_by_seqnum(seq)
+        self.assertEqual(body, 'v2')
+
+        body = self.kv.get_by_seqnum(seq - 1)
+        self.assertEqual(body, 'v1')
+
+    def assertSlice(self, range_iter, expected):
+        self.assertEqual([result for result in range_iter], expected)
+
+    def test_get_range(self):
+        self.kv.update(aa='r1', bb='r2', bbb='r3', dd='r4', ee='r5', gg='r6')
+        self.assertSlice(self.kv['bb':'ee'], [
+            ('bb', 'r2'),
+            ('bbb', 'r3'),
+            ('dd', 'r4'),
+            ('ee', 'r5'),
+        ])
+        self.assertSlice(self.kv['cc':'ff'], [
+            ('dd', 'r4'),
+            ('ee', 'r5'),
+        ])
+
+        self.assertSlice(self.kv[:'cc'], [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3'),
+        ])
+        self.assertSlice(self.kv['cc':], [
+            ('dd', 'r4'),
+            ('ee', 'r5'),
+            ('gg', 'r6'),
+        ])
+        self.assertSlice(self.kv[:], [
+            ('aa', 'r1'),
+            ('bb', 'r2'),
+            ('bbb', 'r3'),
+            ('dd', 'r4'),
+            ('ee', 'r5'),
+            ('gg', 'r6'),
+        ])
+
+        self.assertSlice(self.kv['cc1':'cc2'], [])
+        self.assertSlice(self.kv[:'\x01'], [])
+        self.assertSlice(self.kv['\xff':], [])
+
+    def test_get_range_reverse(self):
+        self.kv.update(aa='r1', bb='r2', bbb='r3', dd='r4', ee='r5', gg='r6')
+
+        # Reverse is implied.
+        self.assertSlice(self.kv['ee':'bb'], [
+            ('ee', 'r5'),
+            ('dd', 'r4'),
+            ('bbb', 'r3'),
+            ('bb', 'r2'),
+        ])
+        self.assertSlice(self.kv['bb':'ee':True], [
+            ('ee', 'r5'),
+            ('dd', 'r4'),
+            ('bbb', 'r3'),
+            ('bb', 'r2'),
+        ])
+        self.assertSlice(self.kv['ff':'cc'], [
+            ('ee', 'r5'),
+            ('dd', 'r4'),
+        ])
+
+        self.assertSlice(self.kv[:'cc':True], [
+            ('bbb', 'r3'),
+            ('bb', 'r2'),
+            ('aa', 'r1'),
+        ])
+        self.assertSlice(self.kv['cc'::True], [
+            ('gg', 'r6'),
+            ('ee', 'r5'),
+            ('dd', 'r4'),
+        ])
+        self.assertSlice(self.kv[::True], [
+            ('gg', 'r6'),
+            ('ee', 'r5'),
+            ('dd', 'r4'),
+            ('bbb', 'r3'),
+            ('bb', 'r2'),
+            ('aa', 'r1'),
+        ])
+
+        self.assertSlice(self.kv['cc2':'cc1'], [])
+        self.assertSlice(self.kv[:'\x01':True], [])
+        self.assertSlice(self.kv['\xff'::True], [])
+
+    def keys_values_iterators(self):
+        K = self.kv
+        K.update(aa='r1', bb='r2', dd='r3', ee='r4')
+
+        self.assertEqual(list(K.keys()), ['aa', 'bb', 'dd', 'ee'])
+        self.assertEqual(list(K.keys(reverse=True)), 
+                         ['ee', 'dd', 'bb', 'aa'])
+        self.assertEqual(list(K.keys(start='aa2')), ['bb', 'dd', 'ee'])
+        self.assertEqual(list(K.keys(start='cc', reverse=True)), 
+                         ['bb', 'aa'])
+        self.assertEqual(list(K.keys(start='\xff')), [])
+
+        self.assertEqual(list(K.values()), ['r1', 'r2', 'r3', 'r4'])
+        self.assertEqual(list(K.values(reverse=True)), 
+                         ['r4', 'r3', 'r2', 'r1'])
+        self.assertEqual(list(K.values(start='aa2')), ['r2', 'r3', 'r4'])
+        self.assertEqual(list(K.values(start='cc', reverse=True)), 
+                         ['r2', 'r1'])
+        self.assertEqual(list(K.keys(start='\x01', reverse=True)), [])
+        
 
 class TestDocument(BaseTestCase):
     def test_document_properties(self):

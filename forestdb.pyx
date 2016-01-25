@@ -346,7 +346,8 @@ cdef class ForestDB(object):
         readonly bint is_open
         readonly filename
 
-    def __cinit__(self, filename, autocommit=True, **config):
+    def __cinit__(self, filename, autocommit=True, buffer_cache=None,
+                  compress=False, purging_interval=None, wal_threshold=None):
         cdef:
             fdb_status status
 
@@ -362,6 +363,14 @@ cdef class ForestDB(object):
 
         # Update configuration values.
         self.config = fdb_get_default_config()
+        if buffer_cache is not None:
+            self.config.buffercache_size = buffer_cache
+        if compress:
+            self.config.compress_document_body = True
+        if purging_interval is not None:
+            self.config.purging_interval = purging_interval
+        if wal_threshold is not None:
+            self.config.wal_threshold = wal_threshold
 
         # Initialize and open database file handle.
         status = fdb_open(&self.handle, self.encoded_filename, &self.config)
@@ -594,14 +603,23 @@ cdef class KVStore(object):
         _errcheck(fdb_get_byseq(self.handle, doc))
         document = Document.__new__(Document, self, _create=False)
         document.set_document(doc)
-        return document
+        body = document.body
+        document.close()
+        return body
 
     def __setitem__(self, key, body):
         self.set(key, body)
 
     def __getitem__(self, key):
         if isinstance(key, slice):
-            pass
+            start = key.start
+            stop = key.stop
+            reverse = bool(key.step)
+            if start and stop and start > stop:
+                start, stop = stop, start
+                reverse = True
+            return self.get_range(start, stop, reverse)
+
         elif isinstance(key, (int, long)):
             result = self.get_by_seqnum(key)
         else:
@@ -610,11 +628,29 @@ cdef class KVStore(object):
             raise KeyError(key)
         return result
 
+    def get_range(self, start=None, stop=None, reverse=False):
+        cursor = self.cursor(start=start, stop=stop, reverse=reverse)
+
+        for document in cursor:
+            yield (document.key, document.body)
+            document.close()
+
     def __delitem__(self, key):
         if isinstance(key, slice):
             pass
         else:
             self.delete(key)
+
+    def update(self, _data_dict=None, **data):
+        with self.db.transaction():
+            if _data_dict:
+                for key in _data_dict:
+                    self.set(key, _data_dict[key])
+            if data:
+                for key in data:
+                    self.set(key, data[key])
+
+        return True
 
     def document(self, key=None, meta=None, body=None, seqnum=None,
                  _create=True):
@@ -664,6 +700,14 @@ cdef class KVStore(object):
 
     def __iter__(self):
         return iter(self.cursor())
+
+    def keys(self, start=None, stop=None, skip_start=False, skip_stop=False,
+             reverse=False):
+        return KeysCursor(self, start, stop, skip_start, skip_stop, reverse)
+
+    def values(self, start=None, stop=None, skip_start=False, skip_stop=False,
+             reverse=False):
+        return ValuesCursor(self, start, stop, skip_start, skip_stop, reverse)
 
 
 cdef class Document(object):
@@ -868,17 +912,12 @@ cdef class Cursor(object):
 
     def __next__(self):
         cdef:
-            fdb_doc *doc = NULL
             fdb_status status
 
         if self.stopped:
             raise StopIteration
 
-        status = fdb_iterator_get(self.handle, &doc)
-        if status != FDB_RESULT_SUCCESS:
-            raise StopIteration
-
-        obj = self._value_from_doc(doc)
+        obj = self._get_next_value()
         if self.reverse:
             status = fdb_iterator_prev(self.handle)
         else:
@@ -889,8 +928,16 @@ cdef class Cursor(object):
 
         return obj
 
-    cdef _value_from_doc(self, fdb_doc *doc):
-        cdef Document document
+    cdef _get_next_value(self):
+        cdef:
+            Document document
+            fdb_doc *doc = NULL
+            fdb_status status
+
+        status = fdb_iterator_get(self.handle, &doc)
+        if status != FDB_RESULT_SUCCESS:
+            raise StopIteration
+
         document = Document.__new__(Document, self.kv, _create=False)
         document.set_document(doc)
         return document
@@ -909,6 +956,36 @@ cdef class Cursor(object):
 
     cpdef last(self):
         _errcheck(fdb_iterator_seek_to_max(self.handle))
+
+
+cdef class KeysCursor(Cursor):
+    cdef _get_next_value(self):
+        cdef:
+            fdb_doc *doc = NULL
+            fdb_status status
+
+        status = fdb_iterator_get_metaonly(self.handle, &doc)
+        if status != FDB_RESULT_SUCCESS:
+            raise StopIteration
+
+        key = decode(<char *>doc.key, doc.keylen, False)
+        fdb_doc_free(doc)
+        return key
+
+
+cdef class ValuesCursor(Cursor):
+    cdef _get_next_value(self):
+        cdef:
+            fdb_doc *doc = NULL
+            fdb_status status
+
+        status = fdb_iterator_get(self.handle, &doc)
+        if status != FDB_RESULT_SUCCESS:
+            raise StopIteration
+
+        body = decode(<char *>doc.body, doc.bodylen, False)
+        fdb_doc_free(doc)
+        return body
 
 
 cdef class Transaction(object):
