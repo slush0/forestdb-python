@@ -1,5 +1,5 @@
 from cpython.bytes cimport PyBytes_AsStringAndSize
-from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
+from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, int64_t
 from libc.stdlib cimport free
 import sys
 
@@ -21,6 +21,16 @@ cdef extern from "libforestdb/forestdb.h":
     ctypedef struct fdb_kvs_handle
     ctypedef struct fdb_iterator
     ctypedef int fdb_status
+
+    ctypedef struct fdb_kvs_commit_marker_t:
+        char *kv_store_name
+        uint64_t seqnum
+
+    ctypedef struct fdb_snapshot_info_t:
+        uint64_t marker
+        int64_t num_kvs_markers
+        fdb_kvs_commit_marker_t *kvs_markers
+
 
     ctypedef void (*fdb_log_callback)(int err, const char **msg, void *ctx)
 
@@ -177,6 +187,10 @@ cdef extern from "libforestdb/forestdb.h":
         fdb_kvs_handle *handle_in,
         fdb_kvs_handle **handle_out,
         uint64_t snapshot_seqnum)
+    cdef fdb_status fdb_get_all_snap_markers(fdb_file_handle *,
+                                             fdb_snapshot_info_t **,
+                                             uint64_t *)
+    cdef fdb_status fdb_free_snap_markers(fdb_snapshot_info_t *, uint64_t)
 
     cdef fdb_status fdb_iterator_init(
         fdb_kvs_handle *handle,
@@ -464,57 +478,25 @@ cdef class ForestDB(object):
         return Transaction.__new__(Transaction, self)
 
 
-cdef class KVStore(object):
+cdef class BaseKVStore(object):
     cdef:
-        bytes encoded_name
         fdb_file_handle *db_handle
-        fdb_kvs_config config
         fdb_kvs_handle *handle
         readonly bint is_open
         readonly ForestDB db
-        readonly name
 
-    def __cinit__(self, ForestDB db, name, **config):
-        cdef:
-            fdb_status status
-
+    def __cinit__(self, ForestDB db, name, *_, **__):
         self.db = db
         if not db.is_open:
             raise Exception('Cannot create KVStore on closed database.')
         self.db_handle = self.db.handle
-
-        self.name = name
-        self.encoded_name = encode(name)
-
-        # Update configuration values.
-        self.config = fdb_get_default_kvs_config()
-
-        # Open key-value store.
-        status = fdb_kvs_open(
-            db.handle,
-            &self.handle,
-            <const char *>self.encoded_name,
-            &self.config)
-        _errcheck(status)
-        self.is_open = True
 
     def __dealloc__(self):
         if self.is_open and self.db.handle:
             fdb_kvs_close(self.handle)
 
     cpdef bint open(self):
-        if self.is_open and self.db.is_open and self.db_handle == self.db.handle:
-            return False
-
-        # Open key-value store.
-        _errcheck(fdb_kvs_open(
-            self.db.handle,
-            &self.handle,
-            <const char *>self.encoded_name,
-            &self.config))
-        self.is_open = True
-        self.db_handle = self.db.handle
-        return True
+        raise NotImplementedError
 
     cpdef bint close(self):
         if not self.is_open:
@@ -528,8 +510,7 @@ cdef class KVStore(object):
         return True
 
     cpdef drop(self):
-        self.close()
-        fdb_kvs_remove(self.db.handle, self.name)
+        raise NotImplementedError
 
     cpdef bint set(self, key, body):
         cdef:
@@ -708,6 +689,107 @@ cdef class KVStore(object):
     def values(self, start=None, stop=None, skip_start=False, skip_stop=False,
              reverse=False):
         return ValuesCursor(self, start, stop, skip_start, skip_stop, reverse)
+
+
+cdef class KVStore(BaseKVStore):
+    cdef:
+        bytes encoded_name
+        fdb_kvs_config config
+        readonly name
+
+    def __cinit__(self, ForestDB db, name, *_, **config):
+        self.name = name
+        self.encoded_name = encode(name)
+
+        # Update configuration values.
+        self.config = fdb_get_default_kvs_config()
+
+        # Open key-value store.
+        _errcheck(fdb_kvs_open(
+            db.handle,
+            &self.handle,
+            <const char *>self.encoded_name,
+            &self.config))
+        self.is_open = True
+
+    cpdef bint open(self):
+        if self.is_open and self.db.is_open and self.db_handle == self.db.handle:
+            return False
+
+        # Open key-value store.
+        _errcheck(fdb_kvs_open(
+            self.db.handle,
+            &self.handle,
+            <const char *>self.encoded_name,
+            &self.config))
+        self.is_open = True
+        self.db_handle = self.db.handle
+        return True
+
+    cpdef drop(self):
+        self.close()
+        fdb_kvs_remove(self.db.handle, self.name)
+
+    cpdef snapshot(self, seqnum=None, in_memory=False):
+        if in_memory:
+            seqnum = <uint64_t>(-1)
+        elif seqnum is None:
+            seqnum = self.last_seqnum()
+        return Snapshot(self.db, self, seqnum)
+
+    cpdef snapshots_available(self):
+        cdef:
+            fdb_snapshot_info_t *markers
+            int i = 0, j = 0
+            uint64_t seqnum = 0, ct = 0
+
+        seqnums = []
+        _errcheck(fdb_get_all_snap_markers(self.db.handle, &markers, &ct))
+        for i in range(ct):
+            for j in range(markers[i].num_kvs_markers):
+                kv_name = encode(markers[i].kvs_markers[j].kv_store_name)
+                if kv_name == self.encoded_name:
+                    seqnums.append(markers[i].kvs_markers[j].seqnum)
+
+        _errcheck(fdb_free_snap_markers(markers, ct))
+        return seqnums
+
+
+cdef class Snapshot(BaseKVStore):
+    cdef:
+        fdb_kvs_handle *kv_handle
+        readonly KVStore kv
+        readonly uint64_t seqnum
+
+    def __cinit__(self, ForestDB db, KVStore kv, seqnum, *_, **__):
+        self.kv = kv
+        self.kv_handle = kv.handle
+        self.seqnum = seqnum
+
+        # Open snapshot.
+        _errcheck(fdb_snapshot_open(kv.handle, &self.handle, self.seqnum))
+        self.is_open = True
+
+    cpdef bint open(self):
+        if self.is_open and self.kv.is_open and \
+           self.kv_handle == self.kv.handle:
+            return False
+
+        # Open snapshot.
+        _errcheck(fdb_snapshot_open(self.kv.handle, &self.handle, self.seqnum))
+        self.is_open = True
+        self.db_handle = self.db.handle
+        return True
+
+    cpdef drop(self):
+        self.close()
+        fdb_kvs_remove(self.db.handle, self.name)
+
+    cpdef bint set(self, key, body):
+        raise NotImplementedError('Snapshots are read-only.')
+
+    cpdef bint delete(self, key):
+        raise NotImplementedError('Snapshots are read-only.')
 
 
 cdef class Document(object):
