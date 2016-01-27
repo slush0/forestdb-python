@@ -714,6 +714,9 @@ cdef class BaseKVStore(object):
         _errcheck(fdb_get_kvs_seqnum(self.handle, &seqnum))
         return seqnum
 
+    def __len__(self):
+        return self.info()['doc_count']
+
     def info(self):
         cdef:
             fdb_kvs_info info
@@ -758,7 +761,7 @@ cdef class BaseKVStore(object):
         return KeysCursor(self, start, stop, skip_start, skip_stop, reverse)
 
     def values(self, start=None, stop=None, skip_start=False, skip_stop=False,
-             reverse=False):
+               reverse=False):
         return ValuesCursor(self, start, stop, skip_start, skip_stop, reverse)
 
 
