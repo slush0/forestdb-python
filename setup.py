@@ -15,7 +15,7 @@ extension = Extension(
 
 setup(
     name='forestdb',
-    version='0.1.0',
+    version='0.1.1',
     description='Fast Python bindings for the forestdb embedded database.',
     author='Charles Leifer',
     author_email='',
