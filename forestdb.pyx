@@ -301,12 +301,18 @@ cdef int FDB_RESULT_ITERATOR_FAIL = -12
 cdef int FDB_RESULT_SEEK_FAIL = -13
 
 
+cdef bint IS_PY3K = sys.version_info[0] == 3
+
 # Helper method to ensure that a string-like object is converted to bytes.
 cdef bytes encode(obj):
     if isinstance(obj, unicode):
         return obj.encode('utf-8')
+    elif isinstance(obj, bytes):
+        return obj
     elif obj is None:
         return obj
+    elif IS_PY3K:
+        return bytes(str(obj), 'utf-8')
     return bytes(obj)
 
 cdef decode(char *ptr, size_t n, free_ptr=True):
@@ -319,8 +325,6 @@ cdef decode(char *ptr, size_t n, free_ptr=True):
         except UnicodeDecodeError:
             pass
     return value
-
-cdef bint IS_PY3K = sys.version_info[0] == 3
 
 if IS_PY3K:
     long = int
