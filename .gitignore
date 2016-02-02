@@ -1,0 +1,4 @@
+forestdb.so
+forestdb.c
+*.pyc
+MANIFEST
