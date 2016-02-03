@@ -3,7 +3,7 @@ from distutils.core import setup, Extension
 try:
     from Cython.Build import cythonize
 except ImportError:
-    raise RuntimeError('Cython must be installed to build unqlite-python.')
+    raise RuntimeError('Cython must be installed to build forestdb-python.')
 
 
 python_source = 'forestdb.pyx'
